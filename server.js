@@ -33,8 +33,12 @@ const PORT = process.env.PORT || 3000;
 
 const sessions = {};
 
+// Rate limit sederhana: 1 request per nomor per 60 detik
+const rateLimit = {};
+const RATE_LIMIT_MS = 60000;
+
 // ============================================================
-// BIKIN SESSION PAIRING (FIXED — socket gak langsung nutup)
+// BIKIN SESSION PAIRING (ANTI LOOP)
 // ============================================================
 async function createPairingSession(phone, username) {
     const sessionDir = path.join(__dirname, 'sessions', phone);
@@ -47,7 +51,6 @@ async function createPairingSession(phone, username) {
 
     const logger = pino({ level: 'silent' });
 
-    // FIX: Kasih keep-alive interval lebih panjang + timeout lebih besar
     const sock = makeWASocket({
         version,
         logger,
@@ -60,9 +63,9 @@ async function createPairingSession(phone, username) {
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: false,
-        keepAliveIntervalMs: 30000,      // <-- FIX: keep alive 30 detik
-        connectTimeoutMs: 60000,          // <-- FIX: timeout 60 detik
-        defaultQueryTimeoutMs: 60000,     // <-- FIX: query timeout 60 detik
+        keepAliveIntervalMs: 30000,
+        connectTimeoutMs: 90000,
+        defaultQueryTimeoutMs: 90000,
         emitOwnEvents: false,
         getMessage: async () => ({ conversation: '' })
     });
@@ -81,36 +84,68 @@ async function createPairingSession(phone, username) {
 
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`[${phone}] ❌ Connection closed (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
+            const reason = lastDisconnect?.error?.message || 'unknown';
+
+            // Map status code ke penjelasan
+            let reasonText = reason;
+            if (statusCode === DisconnectReason.loggedOut) reasonText = 'Logged Out';
+            else if (statusCode === 401) reasonText = 'Unauthorized';
+            else if (statusCode === 428) reasonText = 'Connection Terminated (rate limit)';
+            else if (statusCode === 440) reasonText = 'Conflict (paired elsewhere)';
+            else if (statusCode === 500) reasonText = 'Server Error';
+            else if (statusCode === 515) reasonText = 'Stream Error';
+
+            console.log(`[${phone}] ❌ Connection closed. Code: ${statusCode} (${reasonText})`);
 
             if (sessions[phone]) {
                 sessions[phone].status = 'offline';
+                sessions[phone].lastError = reasonText;
             }
 
-            if (shouldReconnect) {
+            // JANGAN auto-reconnect kalau:
+            // - logged out
+            // - rate limit (biar gak loop)
+            // - konflik
+            const DONT_RECONNECT = [
+                DisconnectReason.loggedOut,
+                401,  // unauthorized
+                428,  // rate limit
+                440,  // conflict
+            ];
+
+            const shouldReconnect = !DONT_RECONNECT.includes(statusCode);
+
+            if (shouldReconnect && sessions[phone]) {
+                console.log(`[${phone}] 🔄 Reconnecting in 5s...`);
                 setTimeout(() => {
-                    createPairingSession(phone, username).catch(err => {
-                        console.error(`[${phone}] Reconnect error:`, err.message);
-                    });
-                }, 3000);
+                    if (sessions[phone]) {
+                        createPairingSession(phone, username).catch(err => {
+                            console.error(`[${phone}] Reconnect error:`, err.message);
+                        });
+                    }
+                }, 5000);
             } else {
-                try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
-                delete sessions[phone];
+                console.log(`[${phone}] 🚫 Not reconnecting (${reasonText})`);
+                // JANGAN hapus session, biar kodenya masih bisa dipake
             }
         }
     });
 
-    sessions[phone] = {
-        sock,
-        code: sessions[phone]?.code || null,
-        status: 'pending',
-        username: username || 'unknown',
-        createdAt: Date.now()
-    };
+    if (!sessions[phone]) {
+        sessions[phone] = {
+            sock,
+            code: null,
+            status: 'pending',
+            username: username || 'unknown',
+            createdAt: Date.now()
+        };
+    } else {
+        sessions[phone].sock = sock;
+        sessions[phone].status = 'pending';
+    }
 
     if (!sock.authState.creds.registered) {
-        await new Promise(r => setTimeout(r, 2000)); // <-- FIX: kasih waktu socket ready
+        await new Promise(r => setTimeout(r, 2000));
 
         try {
             const cleanPhone = phone.replace(/[^0-9]/g, '');
@@ -158,7 +193,17 @@ app.post('/pair', async (req, res) => {
         return res.status(400).json({ error: 'Nomor tidak valid' });
     }
 
-    // Kalau session masih pending → return code yang sama (jangan bikin socket baru)
+    // RATE LIMIT
+    const now = Date.now();
+    if (rateLimit[cleanPhone] && (now - rateLimit[cleanPhone]) < RATE_LIMIT_MS) {
+        const waitSec = Math.ceil((RATE_LIMIT_MS - (now - rateLimit[cleanPhone])) / 1000);
+        return res.status(429).json({
+            error: `Terlalu banyak request. Tunggu ${waitSec} detik lagi.`,
+            waitSeconds: waitSec
+        });
+    }
+
+    // Kalau masih pending dengan code valid → return code lama
     if (sessions[cleanPhone] && sessions[cleanPhone].code && sessions[cleanPhone].status === 'pending') {
         return res.json({
             code: sessions[cleanPhone].code,
@@ -184,6 +229,8 @@ app.post('/pair', async (req, res) => {
         } catch (e) {}
         delete sessions[cleanPhone];
     }
+
+    rateLimit[cleanPhone] = now;
 
     try {
         const code = await createPairingSession(cleanPhone, username);
@@ -213,6 +260,7 @@ app.get('/status/:phone', (req, res) => {
         connected: s.status === 'connected',
         status: s.status,
         code: s.code,
+        lastError: s.lastError || null,
         createdAt: s.createdAt
     });
 });
@@ -235,6 +283,7 @@ app.delete('/session/:phone', async (req, res) => {
     try { fs.rmSync(sessionDir, { recursive: true, force: true }); } catch (e) {}
 
     delete sessions[cleanPhone];
+    delete rateLimit[cleanPhone];
 
     res.json({ success: true, message: `Session ${cleanPhone} dihapus` });
 });
@@ -244,14 +293,34 @@ app.get('/sessions', (req, res) => {
         phone,
         status: sessions[phone].status,
         code: sessions[phone].code,
+        lastError: sessions[phone].lastError || null,
         username: sessions[phone].username,
         createdAt: sessions[phone].createdAt
     }));
     res.json({ total: list.length, sessions: list });
 });
 
+// ============================================================
+// START SERVER
+// ============================================================
 app.listen(PORT, () => {
     console.log(`🚀 FLOW WhatsApp Pairing Server running on port ${PORT}`);
     console.log(`📦 Node version: ${process.version}`);
     console.log(`📡 Endpoint: http://localhost:${PORT}`);
 });
+
+// JANGAN auto-restore session — biar gak crash loop
+// Uncomment kalau perlu
+// (async () => {
+//     const sessionsDir = path.join(__dirname, 'sessions');
+//     if (!fs.existsSync(sessionsDir)) return;
+//     const phones = fs.readdirSync(sessionsDir);
+//     for (const phone of phones) {
+//         try {
+//             console.log(`🔄 Restoring session: ${phone}`);
+//             await createPairingSession(phone, 'restored');
+//         } catch (e) {
+//             console.error(`Gagal restore ${phone}:`, e.message);
+//         }
+//     }
+// })();
