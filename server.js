@@ -3,7 +3,6 @@
  * Deploy di Railway
  */
 
-// FIX: Polyfill crypto buat Node.js lama / environment yang kurang Web Crypto
 const crypto = require('crypto');
 if (typeof globalThis.crypto === 'undefined') {
     globalThis.crypto = crypto.webcrypto || crypto;
@@ -32,13 +31,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 
-// ============================================================
-// STORAGE SESSION
-// ============================================================
 const sessions = {};
 
 // ============================================================
-// HELPER: BIKIN SESSION PAIRING
+// BIKIN SESSION PAIRING (FIXED — socket gak langsung nutup)
 // ============================================================
 async function createPairingSession(phone, username) {
     const sessionDir = path.join(__dirname, 'sessions', phone);
@@ -51,6 +47,7 @@ async function createPairingSession(phone, username) {
 
     const logger = pino({ level: 'silent' });
 
+    // FIX: Kasih keep-alive interval lebih panjang + timeout lebih besar
     const sock = makeWASocket({
         version,
         logger,
@@ -63,6 +60,10 @@ async function createPairingSession(phone, username) {
         generateHighQualityLinkPreview: false,
         syncFullHistory: false,
         markOnlineOnConnect: false,
+        keepAliveIntervalMs: 30000,      // <-- FIX: keep alive 30 detik
+        connectTimeoutMs: 60000,          // <-- FIX: timeout 60 detik
+        defaultQueryTimeoutMs: 60000,     // <-- FIX: query timeout 60 detik
+        emitOwnEvents: false,
         getMessage: async () => ({ conversation: '' })
     });
 
@@ -81,7 +82,7 @@ async function createPairingSession(phone, username) {
         if (connection === 'close') {
             const statusCode = lastDisconnect?.error?.output?.statusCode;
             const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-            console.log(`[${phone}] ❌ Connection closed. Reconnect: ${shouldReconnect}`);
+            console.log(`[${phone}] ❌ Connection closed (code: ${statusCode}). Reconnect: ${shouldReconnect}`);
 
             if (sessions[phone]) {
                 sessions[phone].status = 'offline';
@@ -109,7 +110,7 @@ async function createPairingSession(phone, username) {
     };
 
     if (!sock.authState.creds.registered) {
-        await new Promise(r => setTimeout(r, 1500));
+        await new Promise(r => setTimeout(r, 2000)); // <-- FIX: kasih waktu socket ready
 
         try {
             const cleanPhone = phone.replace(/[^0-9]/g, '');
@@ -157,6 +158,7 @@ app.post('/pair', async (req, res) => {
         return res.status(400).json({ error: 'Nomor tidak valid' });
     }
 
+    // Kalau session masih pending → return code yang sama (jangan bikin socket baru)
     if (sessions[cleanPhone] && sessions[cleanPhone].code && sessions[cleanPhone].status === 'pending') {
         return res.json({
             code: sessions[cleanPhone].code,
@@ -171,6 +173,16 @@ app.post('/pair', async (req, res) => {
             status: 'connected',
             cached: true
         });
+    }
+
+    // Kalau ada session lama (offline), hapus dulu
+    if (sessions[cleanPhone]) {
+        try {
+            if (sessions[cleanPhone].sock) {
+                await sessions[cleanPhone].sock.logout().catch(() => {});
+            }
+        } catch (e) {}
+        delete sessions[cleanPhone];
     }
 
     try {
@@ -238,27 +250,8 @@ app.get('/sessions', (req, res) => {
     res.json({ total: list.length, sessions: list });
 });
 
-// ============================================================
-// START SERVER
-// ============================================================
 app.listen(PORT, () => {
     console.log(`🚀 FLOW WhatsApp Pairing Server running on port ${PORT}`);
     console.log(`📦 Node version: ${process.version}`);
     console.log(`📡 Endpoint: http://localhost:${PORT}`);
 });
-
-// Auto-restore sessions dari disk saat startup
-(async () => {
-    const sessionsDir = path.join(__dirname, 'sessions');
-    if (!fs.existsSync(sessionsDir)) return;
-
-    const phones = fs.readdirSync(sessionsDir);
-    for (const phone of phones) {
-        try {
-            console.log(`🔄 Restoring session: ${phone}`);
-            await createPairingSession(phone, 'restored');
-        } catch (e) {
-            console.error(`Gagal restore ${phone}:`, e.message);
-        }
-    }
-})();
