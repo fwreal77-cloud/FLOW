@@ -1,14 +1,16 @@
 /**
  * FLOW WhatsApp Pairing Server
  * Deploy di Railway
- * 
- * Endpoints:
- *   GET  /                    → health check
- *   POST /pair                → minta pairing code
- *   GET  /status/:phone       → cek status koneksi
- *   DELETE /session/:phone    → hapus session
- *   GET  /sessions            → list semua session
  */
+
+// FIX: Polyfill crypto buat Node.js lama / environment yang kurang Web Crypto
+const crypto = require('crypto');
+if (typeof globalThis.crypto === 'undefined') {
+    globalThis.crypto = crypto.webcrypto || crypto;
+}
+if (typeof global.crypto === 'undefined') {
+    global.crypto = globalThis.crypto;
+}
 
 const express = require('express');
 const cors = require('cors');
@@ -64,10 +66,8 @@ async function createPairingSession(phone, username) {
         getMessage: async () => ({ conversation: '' })
     });
 
-    // Simpan credential
     sock.ev.on('creds.update', saveCreds);
 
-    // Handle connection update
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect } = update;
 
@@ -100,7 +100,6 @@ async function createPairingSession(phone, username) {
         }
     });
 
-    // Simpan socket ke memory
     sessions[phone] = {
         sock,
         code: sessions[phone]?.code || null,
@@ -109,9 +108,7 @@ async function createPairingSession(phone, username) {
         createdAt: Date.now()
     };
 
-    // Kalau belum register → minta pairing code
     if (!sock.authState.creds.registered) {
-        // Delay dikit biar socket siap
         await new Promise(r => setTimeout(r, 1500));
 
         try {
@@ -137,17 +134,16 @@ async function createPairingSession(phone, username) {
 // ENDPOINTS
 // ============================================================
 
-// Health check
 app.get('/', (req, res) => {
     res.json({
         status: 'ok',
         service: 'FLOW WhatsApp Pairing',
+        nodeVersion: process.version,
         sessions: Object.keys(sessions).length,
         uptime: process.uptime()
     });
 });
 
-// POST /pair
 app.post('/pair', async (req, res) => {
     const { phone, username } = req.body || {};
 
@@ -161,7 +157,6 @@ app.post('/pair', async (req, res) => {
         return res.status(400).json({ error: 'Nomor tidak valid' });
     }
 
-    // Kalau session udah ada & masih pending → return code lama
     if (sessions[cleanPhone] && sessions[cleanPhone].code && sessions[cleanPhone].status === 'pending') {
         return res.json({
             code: sessions[cleanPhone].code,
@@ -170,7 +165,6 @@ app.post('/pair', async (req, res) => {
         });
     }
 
-    // Kalau udah connected
     if (sessions[cleanPhone] && sessions[cleanPhone].status === 'connected') {
         return res.json({
             code: sessions[cleanPhone].code,
@@ -195,7 +189,6 @@ app.post('/pair', async (req, res) => {
     }
 });
 
-// GET /status/:phone
 app.get('/status/:phone', (req, res) => {
     const cleanPhone = String(req.params.phone).replace(/[^0-9]/g, '');
     const s = sessions[cleanPhone];
@@ -212,7 +205,6 @@ app.get('/status/:phone', (req, res) => {
     });
 });
 
-// DELETE /session/:phone
 app.delete('/session/:phone', async (req, res) => {
     const cleanPhone = String(req.params.phone).replace(/[^0-9]/g, '');
     const s = sessions[cleanPhone];
@@ -235,7 +227,6 @@ app.delete('/session/:phone', async (req, res) => {
     res.json({ success: true, message: `Session ${cleanPhone} dihapus` });
 });
 
-// GET /sessions
 app.get('/sessions', (req, res) => {
     const list = Object.keys(sessions).map(phone => ({
         phone,
@@ -252,6 +243,7 @@ app.get('/sessions', (req, res) => {
 // ============================================================
 app.listen(PORT, () => {
     console.log(`🚀 FLOW WhatsApp Pairing Server running on port ${PORT}`);
+    console.log(`📦 Node version: ${process.version}`);
     console.log(`📡 Endpoint: http://localhost:${PORT}`);
 });
 
